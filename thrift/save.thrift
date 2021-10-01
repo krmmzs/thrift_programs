@@ -1,4 +1,4 @@
-mespace cpp save_service
+namespace cpp save_service
 
 service Save
 {
