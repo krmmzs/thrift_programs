@@ -2,10 +2,17 @@
 // You should copy it to another filename to avoid overwriting it.
 
 #include "match_server/Match.h"
+#include "save_client/Save.h"
+#include <thrift/concurrency/ThreadManager.h>
+#include <thrift/concurrency/ThreadFactory.h>
 #include <thrift/protocol/TBinaryProtocol.h>
 #include <thrift/server/TSimpleServer.h>
+#include <thrift/server/TThreadedServer.h>
 #include <thrift/transport/TServerSocket.h>
 #include <thrift/transport/TBufferTransports.h>
+#include <thrift/transport/TTransportUtils.h>
+#include <thrift/transport/TSocket.h>
+#include <thrift/TToString.h>
 
 #include <iostream>
 #include <thread> // Open threads
@@ -13,13 +20,15 @@
 #include <condition_variable> //condition variable
 #include <queue>
 #include <vector>
+#include <unistd.h>
 
 using namespace ::apache::thrift;
 using namespace ::apache::thrift::protocol;
 using namespace ::apache::thrift::transport;
 using namespace ::apache::thrift::server;
 
-using namespace  ::match_service;
+using namespace ::save_service;
+using namespace ::match_service;
 using namespace std;
 
 struct Task
@@ -41,23 +50,74 @@ class Pool
         void save_result(int a, int b)
         {
             printf("Match Result: %d %d\n", a, b);
+
+            std::shared_ptr<TTransport> socket(new TSocket("123.57.47.211", 9090)); // Fill in the IPadress you need
+            std::shared_ptr<TTransport> transport(new TBufferedTransport(socket));
+            std::shared_ptr<TProtocol> protocol(new TBinaryProtocol(transport));
+            SaveClient client(protocol);
+
+            try {
+                transport->open();
+
+                client.save_data("acs_400", "869a71c7", a, b);// you need to change
+
+                transport->close();
+            } catch (TException& tx) {
+                cout << "ERROR: " << tx.what() << endl;
+            }
+        }
+
+        bool check_match(uint32_t i, uint32_t j)
+        {
+            auto a = users[i], b = users[j];
+            // need to make sure that A matches B, and B matches A
+            int dt = abs(a.score - b.score);
+            int a_max_dif = wt[i] * 50;
+            int b_max_dif = wt[j] * 50;
+
+            return dt <= a_max_dif && dt <= b_max_dif;
         }
 
         void match()
         {
+            for(uint32_t i = 0; i < wt.size(); i ++)
+            {
+                wt[i] ++; // waiting time ++
+            }
+
             while(users.size() > 1)
             {
-                auto a = users[0], b = users[1];
-                users.erase(users.begin());
-                users.erase(users.begin());
+                bool flag = true;
+                for(uint32_t i = 0; i < users.size();i ++)
+                {
+                    for(uint32_t j = i + 1; j < users.size(); j ++)
+                    {
+                        // judge players's match
+                        if (check_match(i, j))
+                        {
+                            // Notice you have to delete the last one before you delete the first one to prevent subscripts from changing 
+                            auto a = users[i], b = users[j];
+                            users.erase(users.begin() + j);
+                            users.erase(users.begin() + i);
+                            wt.erase(wt.begin() + j);
+                            wt.erase(wt.begin() + i);
+                            save_result(a.id, b.id);
+                            flag = false;
+                            break; // If you don't quit, there's a problem with subscripts
+                        }
+                    }
 
-                save_result(a.id, b.id);
+                    if(!flag) break; // express that a match has occurred
+                }
+
+                if(flag) break;
             }
         }
 
         void add(User user)
         {
             users.push_back(user);
+            wt.push_back(0); // Keep the same order as users in vector
         }
 
         void remove(User user)
@@ -66,12 +126,14 @@ class Pool
                 if(users[i].id == user.id)
                 {
                     users.erase(users.begin() + i); // use erase() to remove single element
+                    wt.erase(wt.begin() + i);
                     break;
                 }
         }
 
     private:
         vector<User> users;
+        vector<int> wt; // waiting time, unit: sencond
 }pool;
 
 
@@ -111,15 +173,38 @@ class MatchHandler : virtual public MatchIf
 
 };
 
+class MatchCloneFactory : virtual public MatchIfFactory {
+    public:
+        ~MatchCloneFactory() override = default;
+        MatchIf* getHandler(const ::apache::thrift::TConnectionInfo& connInfo) override
+        {
+            std::shared_ptr<TSocket> sock = std::dynamic_pointer_cast<TSocket>(connInfo.transport);
+            /*
+             * cout << "Incoming connection\n";
+             * cout << "\tSocketInfo: "  << sock->getSocketInfo() << "\n";
+             * cout << "\tPeerHost: "    << sock->getPeerHost() << "\n";
+             * cout << "\tPeerAddress: " << sock->getPeerAddress() << "\n";
+             * cout << "\tPeerPort: "    << sock->getPeerPort() << "\n";
+             */
+             return new MatchHandler;
+        }
+        void releaseHandler(MatchIf* handler) override {
+            delete handler;
+        }
+};
+
 
 void consume_task()
 {
-    while(true)
+    while(true)// is a independent thread
     {
-        unique_lock<mutex> lck(message_queue.m);
+        unique_lock<mutex> lck(message_queue.m);// using queue requires locking
         if (message_queue.q.empty())
         {
-            message_queue.cv.wait(lck);// unlock, then the current thread is blocked.
+            // message_queue.cv.wait(lck);// unlock, then the current thread is blocked.
+            lck.unlock();
+            pool.match();
+            sleep(1);
         }
         else
         {
@@ -131,27 +216,25 @@ void consume_task()
             if (task.type == "add") pool.add(task.user);
             else if (task.type == "remove") pool.remove(task.user);
 
-            pool.match();
         }
     }
 }
 
+
 int main(int argc, char **argv) 
 {
-    int port = 9090;
-    ::std::shared_ptr<MatchHandler> handler(new MatchHandler());
-    ::std::shared_ptr<TProcessor> processor(new MatchProcessor(handler));
-    ::std::shared_ptr<TServerTransport> serverTransport(new TServerSocket(port));
-    ::std::shared_ptr<TTransportFactory> transportFactory(new TBufferedTransportFactory());
-    ::std::shared_ptr<TProtocolFactory> protocolFactory(new TBinaryProtocolFactory());
+    TThreadedServer server(
+            std::make_shared<MatchProcessorFactory>(std::make_shared<MatchCloneFactory>()),
+            std::make_shared<TServerSocket>(9090), //port
+            std::make_shared<TBufferedTransportFactory>(),
+            std::make_shared<TBinaryProtocolFactory>());
 
-    TSimpleServer server(processor, serverTransport, transportFactory, protocolFactory);
 
     cout << "Start Match Server" << endl;
 
     thread matching_thread(consume_task); //create a matching_thread
 
-    server.serve();
+    server.serve();// is a independent thread
     return 0;
 }
 
